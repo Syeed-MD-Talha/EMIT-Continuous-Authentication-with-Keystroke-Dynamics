@@ -1,0 +1,11 @@
+venv/
+.venv/
+__pycache__/
+profiles/*.joblib
+logs/
+.streamlit/secrets.toml
+turso.txt
+build/
+dist/
+*.db
+.pytest_cache/
