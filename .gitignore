@@ -5,6 +5,7 @@ profiles/*.joblib
 logs/
 .streamlit/secrets.toml
 turso.txt
+/data/DSL-StrongPasswordData.csv
 build/
 dist/
 *.db

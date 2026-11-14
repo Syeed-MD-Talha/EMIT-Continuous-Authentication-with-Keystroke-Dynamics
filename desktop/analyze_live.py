@@ -5,7 +5,7 @@ Genuine attempts  -> live FRR (how often the real user was flagged) and false lo
 Impostor attempts -> detection rate, and how many attempts it took to LOCK each impostor
                      (one 'trial' = impostor attempts until the session locked).
 Works for both password mode (one row per attempt) and continuous mode (one row per
-100-keystroke window).
+200-keystroke window).
 """
 import sys
 from pathlib import Path

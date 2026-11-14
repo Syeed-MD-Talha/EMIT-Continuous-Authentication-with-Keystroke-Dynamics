@@ -2,6 +2,10 @@
 
 EMIT is a Windows desktop app that learns how you type and scores new typing samples against your enrolled profile. It can verify typing in the background while you work or run a fixed-password retype test inside the app. Desktop profiles, timing features, settings, and verification history stay in a local SQLite database.
 
+**[Download EMIT Desktop for Windows (64-bit)](https://github.com/Syeed-MD-Talha/EMIT-Continuous-Authentication-with-Keystroke-Dynamics/releases/download/v1.0.0/EMITDesktop-1.0.0-windows-x64.zip)** · [Release notes and checksum](https://github.com/Syeed-MD-Talha/EMIT-Continuous-Authentication-with-Keystroke-Dynamics/releases/tag/v1.0.0)
+
+Extract the entire ZIP, then open `EMITDesktop.exe` inside the extracted `EMITDesktop` folder. Keep the `_internal` folder beside the executable. The download includes Python and Qt.
+
 ![EMIT Live session in dark mode, showing the latest decision and anomaly score history](docs/screenshots/live-session.png)
 
 <details>
@@ -85,7 +89,6 @@ The score measures similarity to the enrolled typing pattern and is uncalibrated
 | --- | --- |
 | **Windows desktop** | Capture pairs key presses and releases in memory. SQLite stores profile identifiers, extracted timing features, settings, and decision metadata. Typed characters are never saved to the database. |
 | **Local storage** | The normal Windows database path is `%LOCALAPPDATA%\EMITDesktop\emit.db`. Find the exact location under **Settings → Local database**. Treat a copy of this database as biometric data. |
-| **Optional web prototype** | A JavaScript input component sends key press and release timings to Streamlit. The server stores enrolled feature rows in Turso. The current web UI keeps the live score chart in Streamlit session state. Use a practice password and demo data with this version. |
 
 ## Technology and repository map
 
@@ -97,7 +100,7 @@ The score measures similarity to the enrolled typing pattern and is uncalibrated
 | Enrollment and decisions | One-Class SVM thresholds and continuous score smoothing | [desktop/auth.py](desktop/auth.py), [desktop/continuous.py](desktop/continuous.py), [desktop/monitor.py](desktop/monitor.py) |
 | Local storage and Windows actions | SQLite, Windows APIs, and registry-based startup | [desktop/storage.py](desktop/storage.py), [desktop/response.py](desktop/response.py), [desktop/autostart.py](desktop/autostart.py) |
 | Packaging and tests | PyInstaller, PowerShell, pytest | [emit_desktop.spec](emit_desktop.spec), [build.ps1](build.ps1), [tests](tests) |
-| Research and web prototype | Streamlit, JavaScript, Turso/libSQL, Matplotlib, joblib | [app.py](app.py), [components/keystroke](components/keystroke), [db.py](db.py), [train.py](train.py), [evaluate.py](evaluate.py) |
+| Model evaluation | Matplotlib, joblib, CMU fixed-password benchmark | [train.py](train.py), [evaluate.py](evaluate.py) |
 
 ## Tests and evaluation
 
@@ -110,22 +113,12 @@ The desktop analysis command summarizes locally recorded genuine and impostor at
 
 The offline experiment uses the CMU fixed-password benchmark. It fits a separate profile per subject using sessions 1–4, tests genuine scores on sessions 5–8, and takes five impostor samples per other subject. The evaluator compares hold-only, hold plus digraph, and hold plus digraph and trigraph features. It reports mean ROC AUC and equal error rate (EER) across the first 20 subjects by default and writes [roc.png](roc.png). These results describe the fixed-password experiment. Evaluate free typing separately with live tests.
 
+To reproduce the experiment, create a `data` folder and save the [CMU benchmark CSV](https://www.cs.cmu.edu/~keystroke/DSL-StrongPasswordData.csv) as `data/DSL-StrongPasswordData.csv`.
+
 ```powershell
 .\.venv\Scripts\python.exe train.py tri
 .\.venv\Scripts\python.exe evaluate.py
 ```
-
-## Optional Streamlit prototype
-
-Install the web dependencies, copy the example secrets file, and fill in `TURSO_DATABASE_URL` and `TURSO_AUTH_TOKEN` for your Turso database.
-
-```powershell
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-Copy-Item .streamlit/secrets.toml.example .streamlit/secrets.toml
-.\.venv\Scripts\python.exe -m streamlit run app.py
-```
-
-The prototype supports password retype. For hosted Streamlit, set the same values in the host's secrets configuration and use `app.py` as the entry point. See [AZURE.txt](AZURE.txt) for the existing Azure deployment instructions.
 
 ## Credits
 
