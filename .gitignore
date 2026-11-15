@@ -1,12 +1,41 @@
+# Virtual environments
 venv/
 .venv/
+
+# Python bytecode and caches
 __pycache__/
-profiles/*.joblib
-logs/
-.streamlit/secrets.toml
-turso.txt
-/data/DSL-StrongPasswordData.csv
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Build output (PyInstaller)
 build/
 dist/
+
+# Release artifacts: publish these as GitHub Release assets, not commits
+*.exe
+*.zip
+*.sha256
+
+# Local runtime data
 *.db
-.pytest_cache/
+*.joblib
+profiles/*.joblib
+logs/
+*.log
+
+# Downloaded benchmark data (see README)
+/data/
+
+# Secrets and local config
+.streamlit/secrets.toml
+turso.txt
+.env
+
+# Editor and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
