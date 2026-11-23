@@ -26,12 +26,13 @@ class LivePage(QWidget):
     enrollRequested = Signal()
 
     def __init__(self, db: Database, auth_service: AuthService, capture: CaptureService,
-                 monitor, parent=None):
+                 monitor, enrollment=None, parent=None):
         super().__init__(parent)
         self.db = db
         self.auth_service = auth_service
         self.capture = capture
         self.monitor = monitor
+        self.enrollment = enrollment
         self.live: LiveSession | None = None
         self.continuous: ContinuousSession | None = None
         self._monitoring = False
@@ -44,6 +45,9 @@ class LivePage(QWidget):
         self.capture.keyCaptured.connect(self._on_key)
         self.monitor.decision.connect(self._on_background_decision)
         self.monitor.locked.connect(self._on_background_locked)
+        if enrollment is not None:
+            enrollment.progressChanged.connect(self._on_enrollment_progress)
+            enrollment.periodCompleted.connect(self._on_enrollment_completed)
 
     def _build_ui(self) -> None:
         layout = page_layout(self)
@@ -52,6 +56,9 @@ class LivePage(QWidget):
             "Verify your typing rhythm and review the latest biometric readings.",
             eyebrow="Session monitoring",
         ))
+        self.enrollment_banner = hint_label("")
+        self.enrollment_banner.hide()
+        layout.addWidget(self.enrollment_banner)
         self.status_label = SessionBanner()
         layout.addWidget(self.status_label)
 
@@ -88,7 +95,8 @@ class LivePage(QWidget):
         self.mode_stack.addWidget(self._build_password_panel())
         self.mode_stack.addWidget(self._build_continuous_panel())
         empty = Inset()
-        empty.body.addWidget(hint_label("Create a profile to start verifying your typing rhythm."))
+        self.empty_hint = hint_label("Create a profile to start verifying your typing rhythm.")
+        empty.body.addWidget(self.empty_hint)
         enroll = make_button("Enroll a profile")
         enroll.clicked.connect(self.enrollRequested)
         empty.body.addWidget(enroll, 0, Qt.AlignmentFlag.AlignLeft)
@@ -186,12 +194,41 @@ class LivePage(QWidget):
         return card
 
     def on_shown(self) -> None:
+        self._refresh_enrollment_banner()
         self.refresh_users()
 
     def on_hidden(self) -> None:
         pass
 
+    def _on_enrollment_progress(self, progress: dict) -> None:
+        self._refresh_enrollment_banner(progress)
+
+    def _on_enrollment_completed(self, email: str) -> None:
+        self._refresh_enrollment_banner()
+        self.refresh_users(select=email)
+
+    def _refresh_enrollment_banner(self, progress: dict | None = None) -> None:
+        if self.enrollment is None or not self.enrollment.active:
+            self.enrollment_banner.hide()
+            return
+        progress = progress or self.enrollment.progress()
+        if not progress.get("active"):
+            self.enrollment_banner.hide()
+            return
+        remaining = int(progress.get("remaining_seconds") or 0)
+        hours, remainder = divmod(remaining, 3600)
+        minutes = remainder // 60
+        left = f"{hours}h {minutes:02d}m" if hours else f"{minutes}m"
+        state = "extended" if progress.get("extended") else f"{left} remaining"
+        self.enrollment_banner.setText(
+            f"Enrollment in progress for {progress['email']} — "
+            f"day {progress['day_index']} of {progress['days']} ({state}). "
+            "EMIT will train automatically when the period ends."
+        )
+        self.enrollment_banner.show()
+
     def refresh_users(self, select: str | None = None) -> None:
+        self._refresh_enrollment_banner()
         current = select or self.user_combo.currentText()
         users = self.db.list_users()
         self.user_combo.blockSignals(True)
@@ -210,7 +247,19 @@ class LivePage(QWidget):
             self.verification_title.setText("Verification")
             self.session_chip.set_text("No profile", "neutral")
             self.attempts_chip.set_text("No samples", "neutral")
-            self.status_label.set_state("empty", "Set up a typing profile to begin verification.")
+            if self.enrollment is not None and self.enrollment.active:
+                self.empty_hint.setText(
+                    "Enrollment is in progress. Your profile will appear here after "
+                    "EMIT finishes training."
+                )
+                self.status_label.set_state(
+                    "empty", "Enrollment in progress. Monitoring starts after training."
+                )
+            else:
+                self.empty_hint.setText(
+                    "Create a profile to start verifying your typing rhythm."
+                )
+                self.status_label.set_state("empty", "Set up a typing profile to begin verification.")
             self.password_edit.setEnabled(False)
             self.user_combo.setEnabled(False)
             self.typist_combo.setEnabled(False)

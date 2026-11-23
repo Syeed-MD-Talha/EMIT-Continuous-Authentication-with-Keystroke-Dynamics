@@ -1,7 +1,7 @@
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import QComboBox, QHBoxLayout, QLineEdit, QProgressBar, QVBoxLayout, QWidget
 
-from desktop import auth
+from desktop import auth, autostart
 from desktop.auth import AuthService, EnrollmentSession
 from desktop.capture import CaptureService
 from desktop.storage import Database
@@ -12,8 +12,6 @@ from desktop.ui.widgets import (
     Card, Chip, CurrentPanelStack, Divider, Inset, PageHeader, Select, StatCard,
     field_label, hint_label, label, make_button, mono_label, page_layout, stat_row,
 )
-from desktop.windowizer import Windowizer
-from features import window_features
 
 MODE_CONTINUOUS = 0
 MODE_PASSWORD = 1
@@ -24,29 +22,42 @@ STATE_TRAINING = "training"
 STATE_READY = "ready"
 
 
+def _format_remaining(seconds: int) -> str:
+    if seconds <= 0:
+        return "deadline passed"
+    hours, remainder = divmod(int(seconds), 3600)
+    minutes = remainder // 60
+    if hours:
+        return f"{hours}h {minutes:02d}m"
+    return f"{minutes}m"
+
+
 class EnrollPage(QWidget):
-    """Enroll a local profile from free typing or fixed password samples."""
+    """Enroll a local profile from multi-day free typing or fixed passwords."""
 
     profileSaved = Signal(str)
 
     def __init__(self, db: Database, auth_service: AuthService, capture: CaptureService,
-                 monitor, parent=None):
+                 monitor, enrollment=None, parent=None):
         super().__init__(parent)
         self.db = db
         self.auth_service = auth_service
         self.capture = capture
         self.monitor = monitor
+        self.enrollment = enrollment
         self.session = EnrollmentSession("")
-        self.continuous_rows: list[list[float]] = []
-        self._windowizer = Windowizer(
-            auth.WINDOW_SIZE, auth.ENROLL_STRIDE, auth.IDLE_GAP
-        )
-        self._keys = 0
-        self._collecting = False
         self._state = STATE_IDLE
+        self._progress: dict | None = None
         self._build_ui()
         self.capture.keyCaptured.connect(self._on_key)
         theme.theme.changed.connect(self._refresh_theme)
+        if enrollment is not None:
+            enrollment.progressChanged.connect(self._on_progress)
+            enrollment.periodCompleted.connect(self._on_completed)
+            enrollment.periodExtended.connect(self._on_extended)
+            enrollment.periodCancelled.connect(self._on_cancelled)
+            enrollment.periodFailed.connect(self._on_failed)
+        self._sync_campaign()
 
     def _build_ui(self) -> None:
         layout = page_layout(self)
@@ -103,6 +114,24 @@ class EnrollPage(QWidget):
         self.mode_combo.setMinimumContentsLength(18)
         card.body.addWidget(field_label("Enrollment mode", self.mode_combo))
         card.body.addWidget(self.mode_combo)
+
+        self.period_combo = Select()
+        for days, name in auth.TRAINING_PERIOD_CHOICES.items():
+            self.period_combo.addItem(name, days)
+        try:
+            saved_days = int(
+                self.db.get_setting("enrollment_days", str(auth.DEFAULT_TRAINING_DAYS))
+            )
+        except (TypeError, ValueError):
+            saved_days = auth.DEFAULT_TRAINING_DAYS
+        index = self.period_combo.findData(saved_days)
+        self.period_combo.setCurrentIndex(index if index >= 0 else 0)
+        self.period_label = field_label("Training period", self.period_combo)
+        card.body.addWidget(self.period_label)
+        card.body.addWidget(self.period_combo)
+        card.body.addWidget(hint_label(
+            "EMIT collects timing features in the background and trains when the period ends."
+        ))
         return card
 
     def _build_progress_card(self) -> Card:
@@ -130,12 +159,15 @@ class EnrollPage(QWidget):
         layout.setSpacing(8)
         self.keys_stat = StatCard("Keystrokes")
         self.windows_stat = StatCard("Sample windows")
-        self.target_stat = StatCard("Target keystrokes", str(auth.MIN_CONTINUOUS_KEYS))
-        layout.addLayout(stat_row(self.keys_stat, self.windows_stat, self.target_stat))
+        self.days_stat = StatCard("Days with data")
+        self.period_stat = StatCard("Training day")
+        layout.addLayout(stat_row(
+            self.keys_stat, self.windows_stat, self.days_stat, self.period_stat
+        ))
 
         self.continuous_progress = QProgressBar()
         self.continuous_progress.setAccessibleName("Keystroke collection progress")
-        self.continuous_progress.setRange(0, auth.MIN_CONTINUOUS_KEYS)
+        self.continuous_progress.setRange(0, 1)
         self.continuous_progress.setTextVisible(False)
         layout.addWidget(self.continuous_progress)
         self.continuous_status = hint_label("")
@@ -187,20 +219,28 @@ class EnrollPage(QWidget):
 
     def _build_guide_card(self, continuous: bool) -> Card:
         card = Card("How to enroll", "steps")
-        steps = (
-            (
-                ("Start training", "EMIT begins collecting typing timings."),
-                ("Type as you normally would", "Use any Windows app while EMIT collects samples."),
-                ("Let EMIT build your profile",
-                 f"Training starts automatically after at least {auth.MIN_CONTINUOUS_KEYS} "
-                 f"keystrokes and {auth.MIN_CONTINUOUS_WINDOWS} complete sample windows."),
-            ) if continuous else (
+        if continuous:
+            one = auth.campaign_requirements(1)
+            three = auth.campaign_requirements(3)
+            steps = (
+                ("Choose a training period",
+                 "Pick 1 day or 3 days, then press Start training."),
+                ("Type normally across the period",
+                 "Use any Windows app. EMIT collects timing features in the background."),
+                ("EMIT trains automatically",
+                 f"1 day needs {one['min_keys']} keystrokes and {one['min_windows']} windows. "
+                 f"3 days needs {three['min_keys']} keystrokes, {three['min_windows']} windows, "
+                 f"and {three['min_days']} days with data. Low-data campaigns extend automatically."),
+            )
+        else:
+            steps = (
                 ("Choose a practice password",
                  f"Use the same {auth.MIN_PASSWORD_LEN}–{auth.MAX_PASSWORD_LEN} characters for each sample."),
-                ("Retype it and press Enter", "Type each sample from scratch. Pasting or correcting it invalidates the attempt."),
-                ("Train your profile", f"Save your profile after at least {auth.MIN_ATTEMPTS} valid samples."),
+                ("Retype it and press Enter",
+                 "Type each sample from scratch. Pasting or correcting it invalidates the attempt."),
+                ("Train your profile",
+                 f"Save your profile after at least {auth.MIN_ATTEMPTS} valid samples."),
             )
-        )
         for number, (title, body) in enumerate(steps, 1):
             row = QHBoxLayout()
             row.setSpacing(9)
@@ -217,7 +257,7 @@ class EnrollPage(QWidget):
         return card
 
     def on_shown(self) -> None:
-        self._update_state()
+        self._sync_campaign()
 
     def on_hidden(self) -> None:
         pass
@@ -240,6 +280,10 @@ class EnrollPage(QWidget):
     def _is_continuous(self) -> bool:
         return self.mode_combo.currentIndex() == MODE_CONTINUOUS
 
+    def _selected_days(self) -> int:
+        value = self.period_combo.currentData()
+        return int(value) if value is not None else auth.DEFAULT_TRAINING_DAYS
+
     def _set_status(self, text: str, kind: str = "info") -> None:
         target = self.continuous_status if self._is_continuous() else self.status_label
         target.setProperty("statusKind", kind)
@@ -247,109 +291,118 @@ class EnrollPage(QWidget):
         target.setText(text)
         target.setVisible(bool(text))
 
-    def _set_state(self, state: str) -> None:
-        self._state = state
-        self.training_chip.set_text(*{
-            STATE_IDLE: ("Ready", "neutral"),
-            STATE_COLLECTING: ("Collecting", "info"),
-            STATE_TRAINING: ("Training", "info"),
-            STATE_READY: ("Saved", "ok"),
-        }[state])
-        editable = state not in (STATE_COLLECTING, STATE_TRAINING)
-        self.email_edit.setEnabled(editable)
-        self.mode_combo.setEnabled(editable)
-        if state == STATE_COLLECTING:
-            self.train_button.setText("Stop training")
-            self.train_button.setEnabled(True)
+    # ------------------------------------------------------------ campaign sync
+    def _sync_campaign(self) -> None:
+        if self.enrollment is not None and self.enrollment.active:
+            self._on_progress(self.enrollment.progress())
+        else:
+            if self._state == STATE_COLLECTING:
+                self._state = STATE_IDLE
+            self._progress = None
+            self._update_state()
+
+    def _on_progress(self, progress: dict) -> None:
+        if progress and progress.get("active"):
+            self._progress = progress
+            self._state = STATE_COLLECTING
+            self._update_state()
             self._set_status(
-                f"Collecting data for training... {self._keys} / "
-                f"{auth.MIN_CONTINUOUS_KEYS} keystrokes. Type anywhere in Windows.",
-                "busy",
+                self._campaign_status(progress),
+                "warning" if progress.get("extended") else "busy",
             )
-        elif state == STATE_TRAINING:
-            self.train_button.setText("Training...")
-            self.train_button.setEnabled(False)
-            self._set_status("Training the model on your typing rhythm...", "busy")
-        elif state == STATE_READY:
-            self.train_button.setText("Start training")
-            self.train_button.setEnabled(True)
         else:
-            self.train_button.setText("Start training")
-            self.train_button.setEnabled(True)
-            self._set_status("Start training, then type in any Windows app.")
+            self._progress = None
+            if self._state == STATE_COLLECTING:
+                self._state = STATE_IDLE
+            self._update_state()
 
-    def _mode_changed(self, index: int) -> None:
-        self.sample_stack.setCurrentIndex(index)
-        self.guide_stack.setCurrentIndex(index)
-        self.continuous_rows = []
-        self._keys = 0
-        self._windowizer.reset()
-        self.cadence.clear()
-        self._collecting = False
-        self._set_state(STATE_IDLE)
-        if index == MODE_CONTINUOUS:
-            self._set_status("Start training, then type in any Windows app.")
-        else:
-            self.train_button.setText("Train profile")
-            self._set_status("")
+    def _on_extended(self, progress: dict) -> None:
+        self._on_progress(progress)
+        self._set_status(self._campaign_status(progress), "warning")
+
+    def _on_completed(self, email: str) -> None:
+        self._progress = None
+        self._state = STATE_READY
         self._update_state()
+        self._set_status(f"Training finished. Profile saved for '{email}'.", "success")
+        self.profileSaved.emit(email)
 
-    def _email_changed(self) -> None:
-        email = self._current_email()
-        if email != self.session.email:
-            self.session = EnrollmentSession(email)
-            if self._is_continuous():
-                self._set_state(STATE_IDLE)
-            else:
-                self._set_status("")
+    def _on_cancelled(self) -> None:
+        self._progress = None
+        self._state = STATE_IDLE
         self._update_state()
+        self._set_status("Training cancelled. Samples deleted.", "warning")
 
-    def _on_key(self, code: int, down: float, up: float) -> None:
-        if not self._collecting:
-            return
-        self._keys += 1
-        self.cadence.record(max(0, up - down))
-        for window in self._windowizer.feed({"d": down, "u": up}):
-            self.continuous_rows.append(window_features(window))
-        self._update_counters()
-        if self._ready():
-            self._begin_training()
+    def _on_failed(self, message: str) -> None:
+        self._update_state()
+        self._set_status(message, "warning")
 
-    def _ready(self) -> bool:
+    @staticmethod
+    def _campaign_status(progress: dict) -> str:
+        if progress.get("extended"):
+            return (
+                "Training extended: "
+                f"{progress['keys']}/{progress['min_keys']} keystrokes, "
+                f"{progress['windows']}/{progress['min_windows']} windows, "
+                f"{progress['days_with_data']}/{progress['min_days']} days. Keep typing."
+            )
+        if progress.get("deadline_passed"):
+            return "Deadline reached. Waiting for enough typing data..."
         return (
-            self._keys >= auth.MIN_CONTINUOUS_KEYS
-            and len(self.continuous_rows) >= auth.MIN_CONTINUOUS_WINDOWS
+            f"Day {progress['day_index']} of {progress['days']} · "
+            f"{_format_remaining(progress['remaining_seconds'])} remaining. "
+            "Type normally in any Windows app."
         )
 
-    def _update_counters(self) -> None:
-        if not self._is_continuous():
-            return
-        self.keys_stat.set_value(f"{self._keys}")
-        self.windows_stat.set_value(f"{len(self.continuous_rows)}")
-        self.target_stat.set_value(f"{auth.MIN_CONTINUOUS_KEYS}")
-        self.continuous_progress.setMaximum(auth.MIN_CONTINUOUS_KEYS)
-        self.continuous_progress.setValue(min(self._keys, auth.MIN_CONTINUOUS_KEYS))
-        self.reset_button.setEnabled(self._keys > 0 and self._state != STATE_TRAINING)
-        if self._state == STATE_COLLECTING:
-            self._set_status(
-                f"Collecting data for training... {self._keys} / "
-                f"{auth.MIN_CONTINUOUS_KEYS} keystrokes. Type anywhere in Windows.",
-                "busy",
-            )
-
+    # ------------------------------------------------------------ state/UI sync
     def _update_state(self) -> None:
         email = self._current_email()
         valid = auth.valid_email(email)
         taken = valid and self.db.profile_exists(email)
         continuous = self._is_continuous()
+        active = bool(self.enrollment and self.enrollment.active)
 
-        self.password_edit.setEnabled(valid and not taken and not continuous)
+        editable = not active and self._state != STATE_TRAINING
+        self.email_edit.setEnabled(editable)
+        self.mode_combo.setEnabled(editable)
+        self.period_combo.setEnabled(editable)
+        self.period_label.setVisible(continuous)
+        self.period_combo.setVisible(continuous)
+
+        self.password_edit.setEnabled(valid and not taken and not continuous and not active)
 
         if continuous:
-            if self._state in (STATE_IDLE, STATE_READY):
+            if active:
+                self.training_chip.set_text(
+                    "Extended" if (self._progress or {}).get("extended") else "Collecting",
+                    "warn" if (self._progress or {}).get("extended") else "info",
+                )
+                self.train_button.setText("Stop training")
+                self.train_button.setEnabled(True)
+                self.reset_button.setEnabled(True)
+                self._update_counters(self._progress)
+            else:
+                self.training_chip.set_text(
+                    "Saved" if self._state == STATE_READY else "Ready",
+                    "ok" if self._state == STATE_READY else "neutral",
+                )
+                self.train_button.setText("Start training")
                 self.train_button.setEnabled(valid and not taken)
-            self._update_counters()
+                self.reset_button.setEnabled(False)
+                self._update_counters(None)
+            if not active:
+                if not valid:
+                    self._set_status(
+                        "Enter an email-style identifier, such as you@local.host.",
+                        "warning",
+                    )
+                elif taken and self._state != STATE_READY:
+                    self._set_status(
+                        f"'{email}' is already enrolled. Use another name.", "warning"
+                    )
         else:
+            self.training_chip.set_text("Ready", "neutral")
+            self.train_button.setText("Train profile")
             self.train_button.setEnabled(
                 self.session.can_train() and valid and not taken
             )
@@ -359,13 +412,68 @@ class EnrollPage(QWidget):
             self.progress_label.setText(
                 f"{count} of {auth.MAX_ATTEMPTS} samples · Minimum {auth.MIN_ATTEMPTS} to train"
             )
+            if not valid:
+                self._set_status(
+                    "Enter an email-style identifier, such as you@local.host.",
+                    "warning",
+                )
+            elif taken:
+                self._set_status(
+                    f"'{email}' is already enrolled. Use another name.", "warning"
+                )
 
-        if not valid:
-            self._set_status("Enter an email-style identifier, such as you@local.host.", "warning")
-        elif taken and self._state != STATE_READY:
-            self._set_status(
-                f"'{email}' is already enrolled. Use another name.", "warning"
+    def _update_counters(self, progress: dict | None) -> None:
+        if progress:
+            keys = int(progress["keys"])
+            min_keys = int(progress["min_keys"])
+            windows = int(progress["windows"])
+            min_windows = int(progress["min_windows"])
+            self.keys_stat.set_value(f"{keys} / {min_keys}")
+            self.windows_stat.set_value(f"{windows} / {min_windows}")
+            self.days_stat.set_value(
+                f"{progress['days_with_data']} / {progress['min_days']}"
             )
+            self.period_stat.set_value(
+                f"{progress['day_index']} / {progress['days']}"
+            )
+            self.continuous_progress.setMaximum(max(1, min_keys))
+            self.continuous_progress.setValue(min(keys, min_keys))
+        else:
+            self.keys_stat.set_value("0")
+            self.windows_stat.set_value("0")
+            self.days_stat.set_value("0")
+            self.period_stat.set_value("—")
+            self.continuous_progress.setMaximum(1)
+            self.continuous_progress.setValue(0)
+
+    def _email_changed(self) -> None:
+        email = self._current_email()
+        if email != self.session.email:
+            self.session = EnrollmentSession(email)
+        if not (self.enrollment is not None and self.enrollment.active):
+            self._state = STATE_IDLE
+        self._update_state()
+
+    def _mode_changed(self, index: int) -> None:
+        self.sample_stack.setCurrentIndex(index)
+        self.guide_stack.setCurrentIndex(index)
+        self.period_label.setVisible(index == MODE_CONTINUOUS)
+        self.period_combo.setVisible(index == MODE_CONTINUOUS)
+        self.cadence.clear()
+        active = bool(self.enrollment and self.enrollment.active)
+        if not active:
+            self._state = STATE_IDLE
+        self._update_state()
+        if index == MODE_CONTINUOUS:
+            if not active:
+                self._set_status("Choose a training period, then start training.")
+        else:
+            self._set_status("")
+
+    # ------------------------------------------------------------ collection
+    def _on_key(self, code: int, down: float, up: float) -> None:
+        if self.enrollment is not None and self.enrollment.active:
+            self.cadence.record(max(0, up - down))
 
     # ------------------------------------------------------------ actions
     def _attempt(self, events, bad: bool) -> None:
@@ -386,16 +494,7 @@ class EnrollPage(QWidget):
 
     def _train(self) -> None:
         if self._is_continuous():
-            if self._collecting:
-                self._stop_collecting("Training cancelled.")
-                return
-            email = self._current_email()
-            if self.db.profile_exists(email):
-                self._set_status(
-                    f"'{email}' is already enrolled. Use another name.", "warning"
-                )
-                return
-            self._start_collecting()
+            self._train_campaign()
             return
 
         email = self._current_email()
@@ -415,50 +514,48 @@ class EnrollPage(QWidget):
         self._set_status(f"Profile saved for '{email}'. Live session is ready.", "success")
         self.profileSaved.emit(email)
 
-    def _start_collecting(self) -> None:
-        self.continuous_rows = []
-        self._keys = 0
-        self._windowizer.reset()
-        self.cadence.clear()
-        self._collecting = True
-        self._set_state(STATE_COLLECTING)
-        self._update_counters()
+    def _train_campaign(self) -> None:
+        if self.enrollment is None:
+            self._set_status("Enrollment service is unavailable.", "warning")
+            return
+        if self.enrollment.active:
+            self.enrollment.cancel()
+            return
 
-    def _stop_collecting(self, message: str) -> None:
-        self._collecting = False
-        self._set_state(STATE_IDLE)
-        self._set_status(message, "warning")
-        self._update_state()
-
-    def _begin_training(self) -> None:
-        self._collecting = False
-        self._set_state(STATE_TRAINING)
-        self.reset_button.setEnabled(False)
-        QTimer.singleShot(400, self._finish_continuous)
-
-    def _finish_continuous(self) -> None:
         email = self._current_email()
-        keys = self._keys
-        self.auth_service.save_continuous_profile(
-            email, self.continuous_rows, auth.WINDOW_SIZE
+        days = self._selected_days()
+        ok, error = self.enrollment.start(email, days)
+        if not ok:
+            self._set_status(error or "Could not start training.", "warning")
+            self._update_state()
+            return
+        self.db.set_setting("enrollment_days", str(days))
+        if self.monitor is not None:
+            self.monitor.stop()
+        progress = self.enrollment.progress()
+        self._on_progress(progress)
+        hint = (
+            ""
+            if autostart.is_enabled()
+            else " Enable launch at sign-in in Settings so collection survives a restart."
         )
-        self._set_state(STATE_READY)
         self._set_status(
-            f"Training finished on {keys} keystrokes. Profile saved for '{email}'.",
-            "success",
+            f"Training started. {self._campaign_status(progress)}{hint}", "success"
         )
-        self.profileSaved.emit(email)
 
     def _reset(self) -> None:
+        if self._is_continuous():
+            if self.enrollment is not None and self.enrollment.active:
+                self.enrollment.cancel()
+                self.cadence.clear()
+                return
+            self.cadence.clear()
+            self._state = STATE_IDLE
+            self._update_state()
+            self._set_status("Reset.")
+            return
+
         self.session = EnrollmentSession(self._current_email())
-        self.continuous_rows = []
-        self._keys = 0
-        self._windowizer.reset()
-        self.cadence.clear()
-        self._collecting = False
-        self._set_state(STATE_IDLE)
-        if not self._is_continuous():
-            self.train_button.setText("Train profile")
         self.password_edit.clear()
-        self._set_status("Reset.")
         self._update_state()
+        self._set_status("Reset.")

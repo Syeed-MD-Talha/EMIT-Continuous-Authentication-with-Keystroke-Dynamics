@@ -1,6 +1,6 @@
 from PySide6.QtCore import QObject, Qt
 from PySide6.QtGui import QAction, QColor, QIcon, QPainter, QPixmap
-from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
+from PySide6.QtWidgets import QApplication, QMenu, QMessageBox, QSystemTrayIcon
 
 from desktop.continuous import lock_workstation
 
@@ -27,10 +27,13 @@ def _icon(color: str) -> QIcon:
 class TrayIcon(QObject):
     """Status dot in the notification area with pause and lock actions."""
 
-    def __init__(self, window, capture, parent=None):
+    def __init__(self, window, capture, enrollment=None, parent=None):
         super().__init__(parent)
         self.window = window
         self.capture = capture
+        self.enrollment = enrollment
+        self._tier = "IDLE"
+        self._enrollment_text: str | None = None
         self.tray = QSystemTrayIcon(_icon(COLORS["IDLE"]), self)
         self.tray.setToolTip("EMIT Desktop - idle")
 
@@ -64,8 +67,29 @@ class TrayIcon(QObject):
         self.tray.hide()
 
     def set_tier(self, tier: str) -> None:
+        self._tier = tier
         self.tray.setIcon(_icon(COLORS.get(tier, COLORS["IDLE"])))
-        self.tray.setToolTip(f"EMIT Desktop - {tier.lower()}")
+        self._refresh_tooltip()
+
+    def set_enrollment_progress(self, progress: dict) -> None:
+        if progress and progress.get("active"):
+            state = "extended" if progress.get("extended") else "collecting"
+            self._enrollment_text = (
+                f"training {state} - day {progress['day_index']} of {progress['days']}"
+            )
+            if self.pause_action.isChecked():
+                self.pause_action.setChecked(False)
+            self.pause_action.setEnabled(False)
+        else:
+            self._enrollment_text = None
+            self.pause_action.setEnabled(True)
+        self._refresh_tooltip()
+
+    def _refresh_tooltip(self) -> None:
+        if self._enrollment_text:
+            self.tray.setToolTip(f"EMIT Desktop - {self._enrollment_text}")
+        else:
+            self.tray.setToolTip(f"EMIT Desktop - {self._tier.lower()}")
 
     def notify(self, title: str, message: str, tier: str = "NORMAL") -> None:
         """Show a Windows notification balloon. Works while the window is hidden."""
@@ -84,6 +108,9 @@ class TrayIcon(QObject):
         self.window.activateWindow()
 
     def _toggle_pause(self, paused: bool) -> None:
+        if paused and self.enrollment is not None and self.enrollment.active:
+            self.pause_action.setChecked(False)
+            return
         self.capture.paused = paused
         self.tray.setToolTip(
             "EMIT Desktop - paused" if paused else "EMIT Desktop - monitoring"
@@ -94,5 +121,15 @@ class TrayIcon(QObject):
             self._open()
 
     def _quit(self) -> None:
+        if self.enrollment is not None and self.enrollment.active:
+            answer = QMessageBox.question(
+                None,
+                "EMIT - training in progress",
+                "A multi-day enrollment campaign is still collecting data. "
+                "Quit anyway? Collection stops until EMIT starts again.",
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        self.window.allow_close = True
         self.capture.stop()
         QApplication.instance().quit()

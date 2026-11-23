@@ -70,3 +70,67 @@ def test_password_profile_defaults_to_password_mode(tmp_path):
     assert record["mode"] == "password"
     assert record["password_len"] == 6
     db.close()
+
+
+def test_enrollment_period_roundtrip(tmp_path):
+    db = Database(tmp_path / "test.db")
+    period_id = db.start_enrollment_period(
+        "c@example.com",
+        3,
+        "2026-01-01T09:00:00",
+        "2026-01-04T09:00:00",
+        6000,
+        30,
+        min_days=2,
+    )
+    period = db.get_active_enrollment_period()
+    assert period["id"] == period_id
+    assert period["days"] == 3
+    assert period["status"] == "active"
+
+    db.update_enrollment_keys(period_id, 700)
+    db.add_enrollment_samples(
+        period_id,
+        "c@example.com",
+        [
+            ("2026-01-01T10:00:00", "2026-01-01", [0.1] * 30),
+            ("2026-01-01T11:00:00", "2026-01-01", [0.2] * 30),
+            ("2026-01-02T10:00:00", "2026-01-02", [0.3] * 30),
+        ],
+    )
+
+    period = db.get_enrollment_period(period_id)
+    assert period["keys_collected"] == 700
+    assert period["windows_collected"] == 3
+    assert db.enrollment_daily_counts(period_id) == {
+        "2026-01-01": 2,
+        "2026-01-02": 1,
+    }
+    assert db.enrollment_distinct_days(period_id) == 2
+    assert len(db.load_enrollment_samples(period_id)) == 3
+
+    db.finish_enrollment_period(period_id, "2026-01-04T09:00:00")
+    assert db.get_active_enrollment_period() is None
+    assert db.get_enrollment_period(period_id)["status"] == "completed"
+
+    db.delete_enrollment_samples(period_id)
+    assert db.load_enrollment_samples(period_id) == []
+    db.close()
+
+
+def test_cancel_enrollment_period_deletes_samples(tmp_path):
+    db = Database(tmp_path / "test.db")
+    period_id = db.start_enrollment_period(
+        "c@example.com", 1, "2026-01-01T09:00:00", "2026-01-02T09:00:00", 2000, 10
+    )
+    db.add_enrollment_samples(
+        period_id,
+        "c@example.com",
+        [("2026-01-01T10:00:00", "2026-01-01", [0.1] * 30)],
+    )
+
+    db.cancel_enrollment_period(period_id)
+    assert db.get_active_enrollment_period() is None
+    assert db.get_enrollment_period(period_id)["status"] == "cancelled"
+    assert db.load_enrollment_samples(period_id) == []
+    db.close()

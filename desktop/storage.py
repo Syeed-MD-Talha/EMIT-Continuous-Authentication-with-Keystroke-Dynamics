@@ -22,6 +22,34 @@ CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS enrollment_periods (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    email TEXT NOT NULL,
+    mode TEXT NOT NULL DEFAULT 'continuous',
+    started_at TEXT NOT NULL,
+    ends_at TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    days INTEGER NOT NULL,
+    keys_collected INTEGER NOT NULL DEFAULT 0,
+    windows_collected INTEGER NOT NULL DEFAULT 0,
+    min_keys INTEGER NOT NULL,
+    min_windows INTEGER NOT NULL,
+    min_days INTEGER NOT NULL DEFAULT 1,
+    extended INTEGER NOT NULL DEFAULT 0,
+    completed_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_enrollment_periods_status
+    ON enrollment_periods(status, email);
+CREATE TABLE IF NOT EXISTS enrollment_samples (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    period_id INTEGER NOT NULL,
+    email TEXT NOT NULL,
+    collected_at TEXT NOT NULL,
+    day TEXT NOT NULL,
+    features TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_enrollment_samples_period
+    ON enrollment_samples(period_id, id);
 """
 
 PROFILE_MIGRATIONS = {
@@ -113,6 +141,122 @@ class Database:
     def load_enrollment(self, email: str) -> tuple[list, int]:
         record = self.load_profile_record(email)
         return record["features"], record["password_len"]
+
+    def start_enrollment_period(
+        self,
+        email: str,
+        days: int,
+        started_at: str,
+        ends_at: str,
+        min_keys: int,
+        min_windows: int,
+        min_days: int = 1,
+    ) -> int:
+        with self._conn:
+            cursor = self._conn.execute(
+                "INSERT INTO enrollment_periods "
+                "(email, mode, started_at, ends_at, status, days, "
+                " min_keys, min_windows, min_days) "
+                "VALUES (?, 'continuous', ?, ?, 'active', ?, ?, ?, ?)",
+                (email, started_at, ends_at, days, min_keys, min_windows, min_days),
+            )
+        return int(cursor.lastrowid)
+
+    def get_enrollment_period(self, period_id: int) -> dict | None:
+        row = self._conn.execute(
+            "SELECT * FROM enrollment_periods WHERE id = ?", (period_id,)
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def get_active_enrollment_period(self) -> dict | None:
+        row = self._conn.execute(
+            "SELECT * FROM enrollment_periods WHERE status = 'active' "
+            "ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def add_enrollment_samples(self, period_id: int, email: str, samples) -> int:
+        """samples: iterable of (collected_at, day, features)."""
+        rows = [
+            (period_id, email, collected_at, day, json.dumps(features))
+            for collected_at, day, features in samples
+        ]
+        if not rows:
+            return 0
+        with self._conn:
+            self._conn.executemany(
+                "INSERT INTO enrollment_samples "
+                "(period_id, email, collected_at, day, features) "
+                "VALUES (?, ?, ?, ?, ?)",
+                rows,
+            )
+            self._conn.execute(
+                "UPDATE enrollment_periods "
+                "SET windows_collected = windows_collected + ? WHERE id = ?",
+                (len(rows), period_id),
+            )
+        return len(rows)
+
+    def update_enrollment_keys(self, period_id: int, keys: int) -> None:
+        with self._conn:
+            self._conn.execute(
+                "UPDATE enrollment_periods SET keys_collected = ? WHERE id = ?",
+                (int(keys), period_id),
+            )
+
+    def load_enrollment_samples(self, period_id: int) -> list[list[float]]:
+        rows = self._conn.execute(
+            "SELECT features FROM enrollment_samples WHERE period_id = ? ORDER BY id",
+            (period_id,),
+        ).fetchall()
+        return [json.loads(row["features"]) for row in rows]
+
+    def enrollment_daily_counts(self, period_id: int) -> dict[str, int]:
+        rows = self._conn.execute(
+            "SELECT day, COUNT(*) AS count FROM enrollment_samples "
+            "WHERE period_id = ? GROUP BY day ORDER BY day",
+            (period_id,),
+        ).fetchall()
+        return {row["day"]: int(row["count"]) for row in rows}
+
+    def enrollment_distinct_days(self, period_id: int) -> int:
+        row = self._conn.execute(
+            "SELECT COUNT(DISTINCT day) AS count FROM enrollment_samples "
+            "WHERE period_id = ?",
+            (period_id,),
+        ).fetchone()
+        return int(row["count"]) if row is not None else 0
+
+    def finish_enrollment_period(self, period_id: int, completed_at: str) -> None:
+        with self._conn:
+            self._conn.execute(
+                "UPDATE enrollment_periods SET status = 'completed', completed_at = ? "
+                "WHERE id = ?",
+                (completed_at, period_id),
+            )
+
+    def mark_enrollment_extended(self, period_id: int) -> None:
+        with self._conn:
+            self._conn.execute(
+                "UPDATE enrollment_periods SET extended = 1 WHERE id = ?",
+                (period_id,),
+            )
+
+    def cancel_enrollment_period(self, period_id: int) -> None:
+        with self._conn:
+            self._conn.execute(
+                "DELETE FROM enrollment_samples WHERE period_id = ?", (period_id,)
+            )
+            self._conn.execute(
+                "UPDATE enrollment_periods SET status = 'cancelled' WHERE id = ?",
+                (period_id,),
+            )
+
+    def delete_enrollment_samples(self, period_id: int) -> None:
+        with self._conn:
+            self._conn.execute(
+                "DELETE FROM enrollment_samples WHERE period_id = ?", (period_id,)
+            )
 
     def log_attempt(self, *values) -> None:
         if len(values) != len(LOG_COLUMNS):

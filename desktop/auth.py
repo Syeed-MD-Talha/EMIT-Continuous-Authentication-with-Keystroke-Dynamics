@@ -16,13 +16,27 @@ MAX_SUSPICIOUS_IN_ROW = 3
 MAX_EMAIL_LEN = 100
 
 # Continuous (free-typing) mode
-MIN_CONTINUOUS_KEYS = 600
-MIN_CONTINUOUS_WINDOWS = 5
 WINDOW_SIZE = 200          # keystrokes per decision = one notification
 ENROLL_STRIDE = 100        # overlapping windows give more training samples
 MONITOR_STRIDE = 200       # non-overlapping: exactly one decision per 200 keys
 IDLE_GAP = 2.0
 FEATURE_VERSION = 3
+
+# Multi-day enrollment campaign (continuous free typing only)
+TRAINING_PERIOD_CHOICES = {1: "1 day", 3: "3 days"}
+DEFAULT_TRAINING_DAYS = 1
+CAMPAIGN_REQUIREMENTS = {
+    1: {"min_keys": 2000, "min_windows": 10, "min_days": 1},
+    3: {"min_keys": 6000, "min_windows": 30, "min_days": 2},
+}
+MAX_WINDOWS_PER_DAY = 100
+CAMPAIGN_TICK_SECONDS = 60
+
+
+def campaign_requirements(days: int) -> dict:
+    if days not in CAMPAIGN_REQUIREMENTS:
+        raise ValueError(f"unsupported training period: {days} days")
+    return dict(CAMPAIGN_REQUIREMENTS[days])
 
 EMAIL_RE = re.compile(r"[a-z0-9_%+-]+(\.[a-z0-9_%+-]+)*@([a-z0-9]+(-+[a-z0-9]+)*\.)+[a-z]{2,}")
 

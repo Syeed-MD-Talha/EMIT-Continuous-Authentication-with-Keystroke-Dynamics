@@ -1,6 +1,6 @@
 # EMIT — Continuous Authentication with Keystroke Dynamics
 
-EMIT is a Windows desktop app that learns how you type and scores new typing samples against your enrolled profile. It can verify typing in the background while you work or run a fixed-password retype test inside the app. Desktop profiles, timing features, settings, and verification history stay in a local SQLite database.
+EMIT is a Windows desktop app that learns how you type and scores new typing samples against your enrolled profile. It can verify typing in the background while you work or run a fixed-password retype test inside the app. Continuous enrollment can collect typing over a **1-day or 3-day training period**, then train automatically at the deadline. Desktop profiles, timing features, settings, and verification history stay in a local SQLite database.
 
 **[Download EMIT Desktop for Windows (64-bit)](https://github.com/Syeed-MD-Talha/EMIT-Continuous-Authentication-with-Keystroke-Dynamics/releases/download/v1.0.0/EMITDesktop-1.0.0-windows-x64.zip)** · [Release notes and checksum](https://github.com/Syeed-MD-Talha/EMIT-Continuous-Authentication-with-Keystroke-Dynamics/releases/tag/v1.0.0)
 
@@ -41,6 +41,8 @@ py -3.12 -m venv .venv
 
 Open `dist\EMITDesktop\EMITDesktop.exe`. Keep the bundled `_internal` folder next to the executable when moving the app. EMIT opens a single instance per Windows user, so quit any running copy from the system tray before launching a different build.
 
+Closing the main window keeps EMIT running in the system tray so background monitoring and multi-day enrollment continue. Use **Quit** in the tray menu to stop the app.
+
 To install the standard build for your Windows account, run `.\install.ps1`. It copies the bundle to `%LOCALAPPDATA%\Programs\EMITDesktop`, creates a Start menu shortcut, and registers EMIT to launch at sign-in. You can change launch behavior under **Settings**.
 
 ## How authentication works
@@ -62,10 +64,12 @@ flowchart LR
 
 | Mode | What to do | What EMIT measures |
 | --- | --- | --- |
-| **Continuous · Free typing** | Select the mode, press **Start training**, and type as usual in Windows apps. Enrollment completes after at least **600 keystrokes** and **5 complete sample windows**. | Windows Raw Input timestamps key presses and releases. Enrollment uses **200-keystroke windows** that advance by **100 keystrokes**. An idle gap over **2 seconds** clears a partial window. |
+| **Continuous · Free typing** | Choose a **1-day** or **3-day** training period, press **Start training**, and type as usual in Windows apps. EMIT trains at the deadline once it has at least **2,000 keystrokes and 10 windows** (1 day) or **6,000 keystrokes, 30 windows, and 2 days with data** (3 days). A low-data campaign extends automatically until the minimum is met. | Windows Raw Input timestamps key presses and releases. Enrollment uses **200-keystroke windows** that advance by **100 keystrokes**. An idle gap over **2 seconds** clears a partial window. Active campaign samples are stored in SQLite and deleted after training. |
 | **Password retype** | Use a made-up password of **6–12 characters**. Retype it **5–15 times**, pressing Enter after each attempt, then select **Train profile**. Backspace, Delete, or paste invalidates the sample. | The app records the timing pattern by key position and checks that each valid attempt has the enrolled length. |
 
 Enter an email-style local identifier, or leave it blank to use a default derived from your Windows account. Choose a different identifier to create a second profile.
+
+A multi-day campaign collects in the background while EMIT runs. Keep the app running (closing the window minimizes it to the tray) and enable **Launch EMIT at Windows sign-in** so collection resumes after a restart. If the deadline arrives with too little data, the campaign remains active and trains once the minimum is reached. Only one campaign can be active at a time.
 
 ### 2. Extract features and train the model
 
@@ -87,7 +91,7 @@ The score measures similarity to the enrolled typing pattern and is uncalibrated
 
 | Component | What it handles |
 | --- | --- |
-| **Windows desktop** | Capture pairs key presses and releases in memory. SQLite stores profile identifiers, extracted timing features, settings, and decision metadata. Typed characters are never saved to the database. |
+| **Windows desktop** | Capture pairs key presses and releases in memory. SQLite stores profile identifiers, extracted timing features, settings, and decision metadata. Active campaign windows are timing features only and are deleted after training or cancellation. Typed characters are never saved to the database. |
 | **Local storage** | The normal Windows database path is `%LOCALAPPDATA%\EMITDesktop\emit.db`. Find the exact location under **Settings → Local database**. Treat a copy of this database as biometric data. |
 
 ## Technology and repository map
@@ -97,7 +101,7 @@ The score measures similarity to the enrolled typing pattern and is uncalibrated
 | Desktop UI | Python, PySide6 / Qt | [desktop/ui](desktop/ui), [emit_desktop.py](emit_desktop.py) |
 | Windows input | Raw Input API via Python `ctypes` | [desktop/capture.py](desktop/capture.py), [desktop/windowizer.py](desktop/windowizer.py) |
 | Features and model | NumPy, pandas, scikit-learn | [features.py](features.py), [model.py](model.py) |
-| Enrollment and decisions | One-Class SVM thresholds and continuous score smoothing | [desktop/auth.py](desktop/auth.py), [desktop/continuous.py](desktop/continuous.py), [desktop/monitor.py](desktop/monitor.py) |
+| Enrollment and decisions | Multi-day campaigns, One-Class SVM thresholds, continuous score smoothing | [desktop/enrollment.py](desktop/enrollment.py), [desktop/auth.py](desktop/auth.py), [desktop/continuous.py](desktop/continuous.py), [desktop/monitor.py](desktop/monitor.py) |
 | Local storage and Windows actions | SQLite, Windows APIs, and registry-based startup | [desktop/storage.py](desktop/storage.py), [desktop/response.py](desktop/response.py), [desktop/autostart.py](desktop/autostart.py) |
 | Packaging and tests | PyInstaller, PowerShell, pytest | [emit_desktop.spec](emit_desktop.spec), [build.ps1](build.ps1), [tests](tests) |
 | Model evaluation | Matplotlib, joblib, CMU fixed-password benchmark | [train.py](train.py), [evaluate.py](evaluate.py) |

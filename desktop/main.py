@@ -2,12 +2,14 @@
 import hashlib
 import sys
 
+from PySide6.QtCore import QTimer
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import QApplication
 
 from desktop import auth, autostart, paths, storage
 from desktop.auth import AuthService
 from desktop.capture import CaptureService
+from desktop.enrollment import EnrollmentService
 from desktop.monitor import BackgroundMonitor
 from desktop.ui.main_window import MainWindow
 from desktop.ui import theme
@@ -38,6 +40,7 @@ def _handle_connection(server: QLocalServer, callback) -> None:
 
 def main() -> int:
     app = QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(False)
     app.setApplicationName("EMITDesktop")
     app.setApplicationDisplayName("EMIT Desktop")
     app.setOrganizationName("EMIT")
@@ -63,10 +66,11 @@ def main() -> int:
     capture.start()
 
     auth_service = AuthService(db)
+    enrollment = EnrollmentService(db, auth_service, capture)
     monitor = BackgroundMonitor(db, auth_service, capture)
 
-    window = MainWindow(db, auth_service, capture, monitor)
-    tray = TrayIcon(window, capture)
+    window = MainWindow(db, auth_service, capture, monitor, enrollment)
+    tray = TrayIcon(window, capture, enrollment)
     tray.show()
     window.tierChanged.connect(tray.set_tier)
 
@@ -96,11 +100,45 @@ def main() -> int:
             "LOCKED",
         )
 
+    def on_enrollment_completed(email: str) -> None:
+        tray.notify(
+            "EMIT - training complete",
+            f"Your typing profile for {email} is ready.",
+            "NORMAL",
+        )
+
+    def on_enrollment_extended(progress: dict) -> None:
+        tray.notify(
+            "EMIT - training extended",
+            "Not enough typing data yet. Keep typing; EMIT will train automatically.",
+            "SUSPICIOUS",
+        )
+
     monitor.decision.connect(on_decision)
     monitor.locked.connect(on_locked)
+    enrollment.progressChanged.connect(tray.set_enrollment_progress)
+    enrollment.periodCompleted.connect(on_enrollment_completed)
+    enrollment.periodExtended.connect(on_enrollment_extended)
+    enrollment.periodFailed.connect(lambda message: tray.notify(
+        "EMIT - training failed", message, "SUSPICIOUS"
+    ))
+    window.hiddenToTray.connect(lambda: tray.notify(
+        "EMIT - still running",
+        "EMIT continues collecting typing data in the background. "
+        "Quit from the tray menu to stop it.",
+        "NORMAL",
+    ))
+
+    # Resume an active campaign (and train it if the deadline already passed).
+    enrollment.resume()
+    window.live_page.refresh_users()
 
     # Resume monitoring automatically for the most recent continuous profile.
-    if db.get_setting("monitor_on_start", "1") == "1":
+    if (
+        not enrollment.active
+        and not monitor.active
+        and db.get_setting("monitor_on_start", "1") == "1"
+    ):
         for email in db.list_users():
             try:
                 profile = auth_service.get_profile(email)
@@ -112,6 +150,11 @@ def main() -> int:
                 break
         window.live_page.refresh_users()
 
+    campaign_timer = QTimer()
+    campaign_timer.setInterval(auth.CAMPAIGN_TICK_SECONDS * 1000)
+    campaign_timer.timeout.connect(enrollment.tick)
+    campaign_timer.start()
+
     def show_window() -> None:
         window.showNormal()
         window.raise_()
@@ -121,6 +164,7 @@ def main() -> int:
     show_window()
 
     exit_code = app.exec()
+    enrollment.flush()
     capture.stop()
     tray.hide()
     db.close()

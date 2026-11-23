@@ -1,8 +1,8 @@
 from PySide6.QtCore import QSize, Qt, Signal
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
-    QButtonGroup, QFrame, QHBoxLayout, QMainWindow, QPushButton, QStackedWidget,
-    QVBoxLayout, QWidget,
+    QApplication, QButtonGroup, QFrame, QHBoxLayout, QMainWindow, QPushButton,
+    QStackedWidget, QSystemTrayIcon, QVBoxLayout, QWidget,
 )
 
 from desktop import __version__, paths
@@ -25,16 +25,20 @@ NAV_ITEMS = (
 
 class MainWindow(QMainWindow):
     tierChanged = Signal(str)
+    hiddenToTray = Signal()
 
     def __init__(
         self, db: Database, auth_service: AuthService, capture: CaptureService,
-        monitor: BackgroundMonitor, parent=None,
+        monitor: BackgroundMonitor, enrollment=None, parent=None,
     ):
         super().__init__(parent)
         self.db = db
         self.auth_service = auth_service
         self.capture = capture
         self.monitor = monitor
+        self.enrollment = enrollment
+        self.allow_close = False
+        self._tray_hint_shown = False
         self.setWindowTitle("EMIT Desktop")
         self.setWindowIcon(QIcon(str(paths.project_root() / "desktop" / "assets" / "emit.ico")))
         self.resize(1210, 820)
@@ -51,8 +55,10 @@ class MainWindow(QMainWindow):
         workspace.setSpacing(0)
         workspace.addWidget(self._build_toolbar())
 
-        self.enroll_page = EnrollPage(db, auth_service, capture, monitor)
-        self.live_page = LivePage(db, auth_service, capture, monitor)
+        self.enroll_page = EnrollPage(
+            db, auth_service, capture, monitor, enrollment
+        )
+        self.live_page = LivePage(db, auth_service, capture, monitor, enrollment)
         self.settings_page = SettingsPage(db, monitor)
         self.stack = QStackedWidget()
         self.stack.setObjectName("Pages")
@@ -183,3 +189,17 @@ class MainWindow(QMainWindow):
             if self.monitor.set_profile(email):
                 self.monitor.start()
         self._select(0)
+
+    def closeEvent(self, event) -> None:
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            super().closeEvent(event)
+            QApplication.instance().quit()
+            return
+        if self.allow_close:
+            super().closeEvent(event)
+            return
+        event.ignore()
+        self.hide()
+        if not self._tray_hint_shown:
+            self._tray_hint_shown = True
+            self.hiddenToTray.emit()

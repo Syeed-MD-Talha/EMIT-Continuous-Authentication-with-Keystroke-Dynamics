@@ -7,6 +7,7 @@ from sklearn.svm import OneClassSVM
 NU = 0.1
 GAMMA = 0.001   # LIVE enrolment (5-15 samples): small gamma works best
 GAMMA_OFFLINE = "scale"   # CMU (200 training rows per user)
+GAMMA_SWITCH_ROWS = 50    # multi-day campaigns use the offline gamma
 
 
 def _held_out_scores(Z, nu, gamma, max_folds=10):
@@ -21,9 +22,11 @@ def _held_out_scores(Z, nu, gamma, max_folds=10):
     return scores
 
 
-def fit_profile(X, nu=NU, gamma=GAMMA):
+def fit_profile(X, nu=NU, gamma=None):
     """X: 2-D array/DataFrame of feature rows for ONE user -> profile dict."""
     X = np.asarray(X, dtype=float)
+    if gamma is None:
+        gamma = GAMMA_OFFLINE if len(X) >= GAMMA_SWITCH_ROWS else GAMMA
     scaler = StandardScaler().fit(X)
     Z = scaler.transform(X)
     model = OneClassSVM(nu=nu, gamma=gamma).fit(Z)
